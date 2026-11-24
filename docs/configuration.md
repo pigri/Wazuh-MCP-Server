@@ -35,6 +35,7 @@ There are two kinds of boolean variable:
 | `WAZUH_VERIFY_SSL` | `true` | *Strict.* Verify the Manager's TLS certificate |
 | `WAZUH_ALLOW_SELF_SIGNED` | `false` | *Strict.* `true` disables Manager certificate verification (needed for the stock self-signed certificate unless you reissue it; see [Manager TLS](#manager-tls)). Applies only to the Manager configured here, not to the Indexer or to `clusters.json` entries |
 | `WAZUH_CA_BUNDLE` | *(none)* | PEM file of the CA(s) to trust for the Manager and Indexer instead of the system store. Startup fails if the file does not exist. Not used for a connection whose verification is off; a warning is logged when that is the Manager. Also the default `ca_bundle` for [clusters.json](MULTI_CLUSTER.md#tls) entries |
+| `WAZUH_MAJOR_VERSION` | *(detected)* | Wazuh major version (`4` or `5`). Read from the Manager's `GET /` on first use; set it only to skip the detection. On 5 the server maps the 4.x endpoints Wazuh 5.0 removed (see [Wazuh 5.x](../WAZUH_COMPATIBILITY.md#wazuh-5x)) |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | Timeout for Manager and Indexer requests (1–300). `clusters.json` entries use their own `request_timeout_seconds` |
 | `MAX_CONNECTIONS` | `10` | Maximum concurrent Manager requests, and the Manager connection pool size (1–100). `clusters.json` entries always use 10 |
 | `MAX_ALERTS_PER_QUERY` | `1000` | Largest `limit` accepted by `get_wazuh_alerts` and `search_security_events` (1–10000); also advertised as the schema maximum. Other tools keep their own caps |

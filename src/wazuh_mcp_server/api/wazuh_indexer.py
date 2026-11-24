@@ -3,8 +3,10 @@ Wazuh Indexer client for alert and vulnerability queries.
 
 Wazuh stores alerts and vulnerability data in the Wazuh Indexer
 (Elasticsearch/OpenSearch), not the Manager API. This client queries:
-  - wazuh-alerts-* — alert data (alerts have never had a Manager API endpoint)
-  - wazuh-states-vulnerabilities-* — vulnerability data (removed from Manager API in 4.8.0)
+  - wazuh-alerts-* (4.x) or wazuh-findings-v5-* (5.x) — alert data
+  - wazuh-states-vulnerabilities* — vulnerability data (removed from Manager API in 4.8.0)
+  - 5.x only: the wazuh-states-* inventory, SCA and FIM indices and the rules content,
+    which replace Server API endpoints removed in 5.0 (see wazuh5.py)
 """
 
 import asyncio
@@ -16,13 +18,15 @@ from typing import Any, Dict, List, Optional, Union
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from wazuh_mcp_server.api import wazuh5
 from wazuh_mcp_server.config import tls_verify
 
 logger = logging.getLogger(__name__)
 
-# Index patterns for Wazuh 4.x
+# Index patterns. 4.x names the vulnerability index wazuh-states-vulnerabilities-<cluster>,
+# 5.x wazuh-states-vulnerabilities; the pattern without the dash matches both.
 ALERTS_INDEX = "wazuh-alerts-*"
-VULNERABILITY_INDEX = "wazuh-states-vulnerabilities-*"
+VULNERABILITY_INDEX = "wazuh-states-vulnerabilities*"
 
 
 _QUOTED = re.compile(r'("[^"]*")')
@@ -79,6 +83,23 @@ class WazuhIndexerClient:
         # Cross-Cluster Search: prefix index patterns with a remote cluster name
         # (e.g. "eu" → "eu:wazuh-alerts-*", "*" → all configured remote clusters)
         self.ccs_prefix = ccs_prefix.strip().rstrip(":") if ccs_prefix else ""
+        # Wazuh major version (4 or 5): set by WazuhClient, which reads it from the Server
+        # API; version_provider lets the indexer ask for it when a tool calls here first.
+        self.wazuh_major: Optional[int] = None
+        self.version_provider = None
+
+    async def is_v5(self) -> bool:
+        """True when the Wazuh deployment is 5.x (findings and state indices, 5.x fields)."""
+        if self.wazuh_major is None and self.version_provider is not None:
+            try:
+                await self.version_provider()
+            except Exception as e:  # noqa: BLE001 - fall back to 4.x names
+                logger.debug(f"Wazuh version detection failed: {e}")
+        return (self.wazuh_major or 4) >= 5
+
+    def _field(self, name: str, v5: bool) -> str:
+        """Alert field name for this Wazuh version (4.x names are the reference)."""
+        return wazuh5.alert_field(name) if v5 else name
 
     def _qualified(self, index: str) -> str:
         """Qualify an index pattern with the CCS remote-cluster prefix when configured."""
@@ -275,7 +296,7 @@ class WazuhIndexerClient:
         self,
         timestamp_start: str = "now-24h",
         timestamp_end: str = "now",
-        index: str = "wazuh-alerts-*",
+        index: Optional[str] = None,
         top_rules: int = 50,
         top_agents: int = 50,
     ) -> Dict[str, Any]:
@@ -284,14 +305,19 @@ class WazuhIndexerClient:
         Unlike get_alerts, this is not bounded by a document limit — it returns the true
         total match count plus the top rules, severity levels, and agents for the window.
         Both ISO 8601 and OpenSearch date math (e.g. now-7d) are accepted for the bounds.
+        On 5.x the levels are reported as their 4.x-scale numbers (see wazuh5.LEVEL_NUMBER).
         """
+        v5 = await self.is_v5()
+        f = lambda name: self._field(name, v5)  # noqa: E731
+        if index is None:
+            index = wazuh5.FINDINGS_INDEX if v5 else ALERTS_INDEX
         range_filter: Dict[str, str] = {}
         if timestamp_start:
             range_filter["gte"] = timestamp_start
         if timestamp_end:
             range_filter["lte"] = timestamp_end
         query: Dict[str, Any] = (
-            {"bool": {"must": [{"range": {"timestamp": range_filter}}]}} if range_filter else {"match_all": {}}
+            {"bool": {"must": [{"range": {f("timestamp"): range_filter}}]}} if range_filter else {"match_all": {}}
         )
         body = {
             "size": 0,
@@ -299,11 +325,20 @@ class WazuhIndexerClient:
             "query": query,
             "aggs": {
                 "by_rule": {
-                    "terms": {"field": "rule.id", "size": top_rules},
-                    "aggs": {"info": {"top_hits": {"size": 1, "_source": ["rule.description", "rule.level"]}}},
+                    "terms": {"field": f("rule.id"), "size": top_rules},
+                    "aggs": {
+                        "info": {
+                            "top_hits": {
+                                "size": 1,
+                                "_source": (
+                                    ["wazuh.rule", "rule", "message"] if v5 else ["rule.description", "rule.level"]
+                                ),
+                            }
+                        }
+                    },
                 },
-                "by_level": {"terms": {"field": "rule.level", "size": 20}},
-                "by_agent": {"terms": {"field": "agent.name", "size": top_agents}},
+                "by_level": {"terms": {"field": f("rule.level"), "size": 20}},
+                "by_agent": {"terms": {"field": f("agent.name"), "size": top_agents}},
             },
         }
         if self._circuit_breaker is not None:
@@ -316,6 +351,8 @@ class WazuhIndexerClient:
         def _rule_row(bucket: Dict[str, Any]) -> Dict[str, Any]:
             hits = bucket.get("info", {}).get("hits", {}).get("hits", [])
             source = (hits[0].get("_source") or {}) if hits else {}
+            if v5 and isinstance(source, dict):
+                source = wazuh5.normalize_finding(source)
             rule = (source.get("rule") or {}) if isinstance(source, dict) else {}
             return {
                 "rule_id": bucket.get("key"),
@@ -329,7 +366,15 @@ class WazuhIndexerClient:
             "total_alerts": self._total_hits(resp.get("hits", {})),
             "top_rules": [_rule_row(b) for b in aggs.get("by_rule", {}).get("buckets", [])],
             "by_level": [
-                {"level": b.get("key"), "count": b.get("doc_count", 0)}
+                (
+                    {
+                        "level": wazuh5.level_number(b.get("key")),
+                        "severity": b.get("key"),
+                        "count": b.get("doc_count", 0),
+                    }
+                    if v5
+                    else {"level": b.get("key"), "count": b.get("doc_count", 0)}
+                )
                 for b in aggs.get("by_level", {}).get("buckets", [])
             ],
             "top_agents": [
@@ -370,20 +415,37 @@ class WazuhIndexerClient:
         Returns:
             Alert data in standard Wazuh format
         """
+        v5 = await self.is_v5()
+        f = lambda name: self._field(name, v5)  # noqa: E731
         # Build bool query with must clauses for each non-empty filter
         must_clauses: list = []
 
         if rule_id:
             # Exact match on a keyword field — term, not match (which would tokenize).
-            must_clauses.append({"term": {"rule.id": rule_id}})
+            must_clauses.append({"term": {f("rule.id"): rule_id}})
 
         if agent_id:
-            must_clauses.append({"term": {"agent.id": agent_id}})
+            must_clauses.append({"term": {f("agent.id"): agent_id}})
 
         if rule_groups:
             # rule.groups is a keyword array — a terms query matches documents whose
-            # groups contain at least one of the requested values (OR semantics)
-            must_clauses.append({"terms": {"rule.groups": rule_groups}})
+            # groups contain at least one of the requested values (OR semantics).
+            # 5.x: rule tags, event categories and the integration name stand in for groups.
+            if v5:
+                must_clauses.append(
+                    {
+                        "bool": {
+                            "should": [
+                                {"terms": {"wazuh.rule.tags": rule_groups}},
+                                {"terms": {"event.category": rule_groups}},
+                                {"terms": {"wazuh.integration.name": rule_groups}},
+                            ],
+                            "minimum_should_match": 1,
+                        }
+                    }
+                )
+            else:
+                must_clauses.append({"terms": {"rule.groups": rule_groups}})
 
         if level:
             # level is a minimum severity threshold (e.g. "10" means level >= 10).
@@ -394,15 +456,19 @@ class WazuhIndexerClient:
                 min_level = int(str(level).rstrip("+"))
             except (ValueError, TypeError):
                 raise ValueError(f"Invalid level filter {level!r}: expected a number like '10' or '10+'")
-            must_clauses.append({"range": {"rule.level": {"gte": min_level}}})
+            if v5:
+                # 5.x levels are keywords: match those whose 4.x-scale number is high enough
+                must_clauses.append({"terms": {"wazuh.rule.level": wazuh5.levels_at_least(min_level)}})
+            else:
+                must_clauses.append({"range": {"rule.level": {"gte": min_level}}})
 
         if srcip:
             # IPs are exact-match keyword fields — term avoids false positives from
             # tokenizing on the dots (e.g. 192.168.1.1 matching 192.168.1.99).
-            must_clauses.append({"term": {"data.srcip": srcip}})
+            must_clauses.append({"term": {f("data.srcip"): srcip}})
 
         if dstip:
-            must_clauses.append({"term": {"data.dstip": dstip}})
+            must_clauses.append({"term": {f("data.dstip"): dstip}})
 
         if timestamp_start or timestamp_end:
             time_range: Dict[str, str] = {}
@@ -410,7 +476,7 @@ class WazuhIndexerClient:
                 time_range["gte"] = timestamp_start
             if timestamp_end:
                 time_range["lte"] = timestamp_end
-            must_clauses.append({"range": {"timestamp": time_range}})
+            must_clauses.append({"range": {f("timestamp"): time_range}})
 
         if query_text:
             # simple_query_string has a restricted, injection-safe grammar (no arbitrary
@@ -419,16 +485,22 @@ class WazuhIndexerClient:
             # denial-of-service from authenticated read users. AND/OR/NOT, quoted phrases,
             # and trailing-wildcard prefixes remain supported.
             qt = _to_simple_query_syntax(query_text.strip().lstrip("*?"))  # no leading wildcard
-            must_clauses.append(
-                {
-                    "simple_query_string": {
-                        "query": qt,
-                        "default_operator": "AND",
-                        "flags": "AND|OR|NOT|PHRASE|PREFIX|WHITESPACE",
-                        "lenient": True,
-                    }
+            simple: Dict[str, Any] = {
+                "simple_query_string": {
+                    "query": qt,
+                    "default_operator": "AND",
+                    "flags": "AND|OR|NOT|PHRASE|PREFIX|WHITESPACE",
+                    "lenient": True,
                 }
-            )
+            }
+            if v5:
+                # 5.x: search named fields (the template's default_field covers only
+                # wazuh.agent.*), and match plain words inside message / rule title
+                simple["simple_query_string"]["fields"] = wazuh5.SEARCH_FIELDS
+                terms = wazuh5.substring_terms(query_text.strip())
+                if terms:
+                    simple = {"bool": {"should": [simple, wazuh5.substring_query(terms)], "minimum_should_match": 1}}
+            must_clauses.append(simple)
 
         if must_clauses:
             query = {"bool": {"must": must_clauses}}
@@ -436,11 +508,18 @@ class WazuhIndexerClient:
             query = {"match_all": {}}
 
         # Use _search helper for consistent retry logic (sorted by timestamp desc)
-        result = await self._search(ALERTS_INDEX, query, size=limit, sort=[{"timestamp": {"order": "desc"}}])
+        result = await self._search(
+            wazuh5.FINDINGS_INDEX if v5 else ALERTS_INDEX,
+            query,
+            size=limit,
+            sort=[{f("timestamp"): {"order": "desc"}}],
+        )
 
-        # Transform to standard Wazuh format
+        # Transform to standard Wazuh format (5.x findings are normalized to the 4.x shape)
         hits = result.get("hits", {})
         alerts = [(hit.get("_source") or {}) for hit in hits.get("hits", [])]
+        if v5:
+            alerts = [wazuh5.normalize_finding(a) for a in alerts]
 
         return {
             "data": {
@@ -453,18 +532,28 @@ class WazuhIndexerClient:
 
     async def latest_fim_event(self, agent_id: str, path: str, event: str) -> Optional[Dict[str, Any]]:
         """Most recent FIM alert of `event` type ("added"/"modified"/"deleted") for an exact path."""
+        v5 = await self.is_v5()
+        f = lambda name: self._field(name, v5)  # noqa: E731
         query = {
             "bool": {
                 "filter": [
-                    {"term": {"agent.id": agent_id}},
-                    {"term": {"syscheck.path": path}},
-                    {"term": {"syscheck.event": event}},
+                    {"term": {f("agent.id"): agent_id}},
+                    {"term": {f("syscheck.path"): path}},
+                    {"term": {f("syscheck.event"): wazuh5.FIM_EVENT_TO_V5.get(event, event) if v5 else event}},
                 ]
             }
         }
-        result = await self._search(ALERTS_INDEX, query, size=1, sort=[{"timestamp": {"order": "desc"}}])
+        result = await self._search(
+            wazuh5.FINDINGS_INDEX if v5 else ALERTS_INDEX,
+            query,
+            size=1,
+            sort=[{f("timestamp"): {"order": "desc"}}],
+        )
         hits = result.get("hits", {}).get("hits", [])
-        return (hits[0].get("_source") or {}) if hits else None
+        if not hits:
+            return None
+        source = hits[0].get("_source") or {}
+        return wazuh5.normalize_finding(source) if v5 else source
 
     async def get_vulnerabilities(
         self,
@@ -485,11 +574,12 @@ class WazuhIndexerClient:
         Returns:
             Vulnerability data matching the criteria
         """
+        v5 = await self.is_v5()
         # Build query
         must_clauses = []
 
         if agent_id:
-            must_clauses.append({"term": {"agent.id": agent_id}})
+            must_clauses.append({"term": {"wazuh.agent.id" if v5 else "agent.id": agent_id}})
 
         if severity:
             # Normalize severity to match indexer format (keyword exact match)
@@ -528,10 +618,14 @@ class WazuhIndexerClient:
                     "under_evaluation": source.get("vulnerability", {}).get("under_evaluation"),
                     "detected_at": source.get("vulnerability", {}).get("detected_at"),
                     "published_at": source.get("vulnerability", {}).get("published_at"),
-                    "agent": {
-                        "id": (source.get("agent") or {}).get("id"),
-                        "name": (source.get("agent") or {}).get("name"),
-                    },
+                    "agent": (
+                        wazuh5.agent_of(source)
+                        if v5
+                        else {
+                            "id": (source.get("agent") or {}).get("id"),
+                            "name": (source.get("agent") or {}).get("name"),
+                        }
+                    ),
                     "package": {
                         "name": source.get("package", {}).get("name"),
                         "version": source.get("package", {}).get("version"),
@@ -576,19 +670,20 @@ class WazuhIndexerClient:
             Summary with counts by severity
         """
         await self._ensure_initialized()
+        v5 = await self.is_v5()
 
         filters: List[Dict[str, Any]] = []
         if agent_id:
-            filters.append({"term": {"agent.id": agent_id}})
+            filters.append({"term": {"wazuh.agent.id" if v5 else "agent.id": agent_id}})
         if detected_since:
             filters.append({"range": {"vulnerability.detected_at": {"gte": detected_since}}})
         query = {"bool": {"filter": filters}} if filters else None
 
         # Use aggregation query via circuit breaker (custom body with size=0)
         if self._circuit_breaker is not None:
-            result = await self._circuit_breaker._call(self._execute_agg_search, query)
+            result = await self._circuit_breaker._call(self._execute_agg_search, query, v5)
         else:
-            result = await self._execute_agg_search(query)
+            result = await self._execute_agg_search(query, v5)
 
         # Parse aggregations
         aggs = result.get("aggregations", {})
@@ -610,7 +705,7 @@ class WazuhIndexerClient:
             }
         }
 
-    async def _execute_agg_search(self, query: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def _execute_agg_search(self, query: Optional[Dict[str, Any]] = None, v5: bool = False) -> Dict[str, Any]:
         """Execute vulnerability aggregation query (called within circuit breaker)."""
         await self._ensure_initialized()
         url = f"{self.base_url}/{self._qualified(VULNERABILITY_INDEX)}/_search"
@@ -618,7 +713,7 @@ class WazuhIndexerClient:
             "size": 0,
             "aggs": {
                 "by_severity": {"terms": {"field": "vulnerability.severity", "size": 10}},
-                "by_agent": {"cardinality": {"field": "agent.id"}},
+                "by_agent": {"cardinality": {"field": "wazuh.agent.id" if v5 else "agent.id"}},
                 "total_vulnerabilities": {"value_count": {"field": "vulnerability.id"}},
             },
         }
@@ -636,6 +731,109 @@ class WazuhIndexerClient:
             raise ValueError(f"Vulnerability summary query failed: {e.response.status_code}")
         except (httpx.ConnectError, httpx.TimeoutException):
             raise ConnectionError(f"Cannot connect to Wazuh Indexer at {self.host}:{self.port}")
+
+    # --- Wazuh 5.x: state indices and content that replace removed Server API endpoints ---
+
+    async def _query(self, index: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a search body through the circuit breaker."""
+        if self._circuit_breaker is not None:
+            return await self._circuit_breaker._call(self._execute_body, index, body)
+        return await self._execute_body(index, body)
+
+    async def _state_items(
+        self,
+        index: str,
+        convert,
+        agent_id: Optional[str] = None,
+        filters: Optional[List[Dict[str, Any]]] = None,
+        limit: int = 500,
+        offset: int = 0,
+        sort: Optional[list] = None,
+    ) -> Dict[str, Any]:
+        """Documents of a 5.x state index (optionally one agent's) as Server API items."""
+        clauses = list(filters or [])
+        if agent_id:
+            clauses.append({"term": {"wazuh.agent.id": agent_id}})
+        body: Dict[str, Any] = {
+            "query": {"bool": {"filter": clauses}} if clauses else {"match_all": {}},
+            "size": max(0, min(int(limit), 10000)),
+            "from": max(0, int(offset)),
+            "track_total_hits": True,
+        }
+        if sort:
+            body["sort"] = sort
+        resp = await self._query(index, body)
+        hits = resp.get("hits", {})
+        items = [convert(h.get("_source") or {}) for h in hits.get("hits", [])]
+        return wazuh5.wazuh_items(items, self._total_hits(hits, len(items)))
+
+    async def get_processes(
+        self, agent_id: str, limit: int = 500, offset: int = 0, pid: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """An agent's processes (wazuh-states-inventory-processes), as 4.x syscollector items."""
+        filters = [{"term": {"process.pid": int(pid)}}] if pid is not None else None
+        return await self._state_items(
+            wazuh5.PROCESSES_INDEX, wazuh5.process_item, agent_id, filters, limit, offset, [{"process.pid": "asc"}]
+        )
+
+    async def get_ports(self, agent_id: str, limit: int = 500, offset: int = 0) -> Dict[str, Any]:
+        """An agent's open ports (wazuh-states-inventory-ports), as 4.x syscollector items."""
+        return await self._state_items(
+            wazuh5.PORTS_INDEX, wazuh5.port_item, agent_id, None, limit, offset, [{"source.port": "asc"}]
+        )
+
+    async def get_fim_files(
+        self, agent_id: str, path: Optional[str] = None, limit: int = 500, offset: int = 0
+    ) -> Dict[str, Any]:
+        """An agent's FIM file inventory (wazuh-states-fim-files), as 4.x syscheck items."""
+        filters = [{"term": {"file.path": path}}] if path else None
+        return await self._state_items(wazuh5.FIM_INDEX, wazuh5.fim_item, agent_id, filters, limit, offset)
+
+    async def get_sca_policies(self, agent_id: str) -> Dict[str, Any]:
+        """An agent's SCA policies with pass/fail counts (wazuh-states-sca), as 4.x /sca items."""
+        body = {
+            "size": 0,
+            "query": {"bool": {"filter": [{"term": {"wazuh.agent.id": agent_id}}]}},
+            "aggs": {
+                "policies": {
+                    "terms": {"field": "policy.id", "size": 100},
+                    "aggs": {
+                        "results": {"terms": {"field": "check.result", "size": 10}},
+                        "info": {"top_hits": {"size": 1, "_source": ["policy"]}},
+                        "last": {"max": {"field": "state.modified_at"}},
+                    },
+                }
+            },
+        }
+        resp = await self._query(wazuh5.SCA_INDEX, body)
+        buckets = resp.get("aggregations", {}).get("policies", {}).get("buckets", [])
+        return wazuh5.wazuh_items([wazuh5.sca_policy_item(b) for b in buckets])
+
+    async def get_sca_checks(
+        self, agent_id: str, policy_id: str, limit: int = 500, offset: int = 0, result: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """The checks of one SCA policy on an agent, as 4.x SCA check items."""
+        filters: List[Dict[str, Any]] = [{"term": {"policy.id": policy_id}}]
+        if result:
+            # 4.x results are lower case; 5.x stores "Passed", "Failed", "Not applicable"
+            filters.append({"term": {"check.result": str(result).strip().capitalize()}})
+        return await self._state_items(
+            wazuh5.SCA_INDEX, wazuh5.sca_check_item, agent_id, filters, limit, offset, [{"check.id": "asc"}]
+        )
+
+    async def get_rules(self, limit: int = 500, offset: int = 0) -> Dict[str, Any]:
+        """Enabled rules of the standard and custom spaces, as 4.x /rules items."""
+        filters = [
+            {"terms": {"space.name": wazuh5.ACTIVE_RULE_SPACES}},
+            {"term": {"document.enabled": True}},
+        ]
+        return await self._state_items(wazuh5.RULES_INDEX, wazuh5.rule_item, None, filters, limit, offset)
+
+    async def count_events(self, since: str = "now-24h") -> int:
+        """Number of events indexed since `since` (5.x wazuh-events-v5-*)."""
+        body = {"size": 0, "track_total_hits": True, "query": {"range": {"@timestamp": {"gte": since}}}}
+        resp = await self._query(wazuh5.EVENTS_INDEX, body)
+        return self._total_hits(resp.get("hits", {}))
 
     async def health_check(self) -> Dict[str, Any]:
         """

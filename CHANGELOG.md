@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Wazuh 5.0 support.** The server reads the Wazuh version from `GET /` (or
+  `WAZUH_MAJOR_VERSION`) and, on 5.x, maps the calls Wazuh 5.0 removed or moved: alerts come
+  from the Security Analytics findings (`wazuh-findings-v5-*`), agent processes and ports, FIM
+  files and SCA results from the `wazuh-states-*` indices, rules from the content index, manager
+  logs and daemon statistics from `/cluster/{node_id}/...`. Tools keep their 4.x response
+  shapes: 5.x findings are normalized to 4.x-shaped alerts (`rule.level` on the 4.x scale,
+  `rule.severity` with the 5.x keyword). Weekly statistics and the active-response write tools
+  report that 5.x has no equivalent. See [WAZUH_COMPATIBILITY.md](WAZUH_COMPATIBILITY.md#wazuh-5x).
+
+### Fixed
+- Vulnerability tools found nothing on Wazuh 5.0, whose index is `wazuh-states-vulnerabilities`
+  without a suffix; the pattern is now `wazuh-states-vulnerabilities*`.
+
 ## [5.0.0] - 2026-09-24
 
 Security and correctness release. Several defaults change and can stop an existing 4.x deployment from working until you act: the Manager certificate is verified, OAuth requires sign-in, write tools need `confirm=true` in production, bearer tokens must be re-minted once, and startup refuses invalid settings. Read [UPGRADING.md](https://github.com/gensecaihq/Wazuh-MCP-Server/blob/main/UPGRADING.md#upgrading-to-500) before upgrading.

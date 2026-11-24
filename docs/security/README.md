@@ -325,8 +325,11 @@ If you never grant `wazuh:write`, leave out the write actions so a compromised s
 run active response.
 
 The Indexer account needs search access to `wazuh-alerts-*` and
-`wazuh-states-vulnerabilities-*` (prefixed with the remote cluster name when `ccs_prefix` is
+`wazuh-states-vulnerabilities*` (prefixed with the remote cluster name when `ccs_prefix` is
 used). It does not need write access.
+
+Wazuh 5.x has fewer Manager API actions and keeps more data in the Indexer: see
+[Wazuh 5.x](../../WAZUH_COMPATIBILITY.md#wazuh-5x) for both accounts' permissions there.
 
 ## Container and deployment hardening
 

@@ -6,6 +6,7 @@ Which Wazuh versions this server works with, which Wazuh APIs it calls, and what
 
 | Wazuh version | Status |
 |---|---|
+| 5.0 | Supported (checked against 5.0.0-rc2). The Wazuh Indexer is required for more tools than on 4.x; see [Wazuh 5.x](#wazuh-5x). Weekly statistics and the active-response write tools are not available. |
 | 4.8.0 – 4.14.7 | Supported. The Wazuh Indexer is required for alert, vulnerability and alert-backed compliance tools. |
 | 4.0 – 4.7 | Not supported. Vulnerability data lives in the Manager API on these versions, and this server only reads it from the Indexer. |
 | < 4.0 | Not supported. |
@@ -18,6 +19,48 @@ What has been checked:
   against the Wazuh 4.14 source.
 - Versions 4.8 – 4.12 are in the supported range but were not re-checked against their API
   specifications for this document.
+
+## Wazuh 5.x
+
+Wazuh 5.0 moved most of the data the 4.x Server API served into the Indexer and removed those
+endpoints. The server reads the version from `GET /` (`data.api_version`) on first use, or from
+`WAZUH_MAJOR_VERSION` when set, and on 5.x maps each 4.x call; tools keep their 4.x response
+shapes. The mapping lives in `src/wazuh_mcp_server/api/wazuh5.py` and `WazuhClient._route_v5`.
+
+| 4.x source | 5.x source | Tools |
+|---|---|---|
+| `wazuh-alerts-*` | `wazuh-findings-v5-*` (Security Analytics findings) | Alert search, summaries, aggregations, threat, IoC, risk, report and ISO 27001 alert evidence |
+| `wazuh-states-vulnerabilities-*` | `wazuh-states-vulnerabilities` (agent under `wazuh.agent`) | Vulnerability tools |
+| `GET /syscollector/{agent_id}/processes`, `/ports` | `wazuh-states-inventory-processes`, `wazuh-states-inventory-ports` | `get_agent_processes`, `get_agent_ports`, `wazuh_check_process` |
+| `GET /syscheck/{agent_id}` | `wazuh-states-fim-files` | `wazuh_check_file_quarantine` |
+| `GET /sca/{agent_id}`, `/sca/{agent_id}/checks/{policy_id}` | `wazuh-states-sca` (pass/fail counts aggregated per policy) | SCA, compliance, risk and ISO 27001 tools |
+| `GET /rules` | `wazuh-threatintel-rules-*` (enabled rules of the `standard` and `custom` spaces) | `get_wazuh_rules_summary` |
+| `GET /manager/logs` | `GET /cluster/{node_id}/logs` | Manager log tools |
+| `GET /manager/stats`, `/manager/stats/remoted` | `GET /cluster/{node_id}/daemons/stats` | Statistics tools |
+| `GET /manager/stats/analysisd` | analysisd daemon stats, plus the number of events in `wazuh-events-v5-*` over 24 hours as `total_events_decoded` | `get_wazuh_log_collector_stats`, ISO 27001 logging evidence |
+| `PUT /manager/restart` | `PUT /cluster/restart?nodes_list=<node>` | `wazuh_restart` with `target=manager` |
+| `GET /manager/stats/weekly` | none | `get_wazuh_weekly_stats` reports that 5.x has no equivalent |
+| `PUT /active-response` | none in the Server API | Active-response write tools report that 5.x has no API for them (5.x runs active responses from Alerting monitors on findings, configured in the dashboard) |
+
+Differences to expect on 5.x:
+
+- **Rule levels** are Sigma keywords. Alerts report `rule.level` as a 4.x-scale number
+  (informational 3, low 5, medium 8, high 12, critical 15) and the keyword as `rule.severity`;
+  a `level` filter of `10` matches high and critical.
+- **Rule ids** are UUIDs, `rule.description` is the rule title, and `rule.groups` holds the rule
+  tags, the event categories and the integration name. The finding's own `rule` (for example an
+  IDS signature) is kept as `rule.event_rule`; compliance mappings are `rule.<framework>`.
+- **Free-text search** names the fields it searches (the 5.x index template limits the default
+  fields to a few `wazuh.agent.*` fields) and also matches up to five plain words as
+  case-insensitive substrings of the message and rule title, because those are keyword fields.
+- `GET /agents` no longer accepts `node_name`, `configSum` or `mergedSum` in `select`; the server
+  drops them.
+
+Indexer account on 5.x: search access to `wazuh-findings-v5-*`, `wazuh-events-v5-*`,
+`wazuh-states-*` and `wazuh-threatintel-rules-*` (or `wazuh-*`). Manager API account on 5.x:
+`agent:read`, `group:read`, `cluster:read` (and `agent:restart`, `cluster:restart` for the
+restart tool); the `sca:read`, `syscheck:read`, `syscollector:read`, `rules:read` and
+`manager:read` actions no longer exist.
 
 ## Where data comes from
 
@@ -92,7 +135,9 @@ From `src/wazuh_mcp_server/api/wazuh_indexer.py`. All access is `POST <index>/_s
 | Index pattern | Used for |
 |---|---|
 | `wazuh-alerts-*` | Alert search, summaries, aggregations (`size=0`), threat and compliance evidence |
-| `wazuh-states-vulnerabilities-*` | Vulnerability listing, critical vulnerabilities, summaries |
+| `wazuh-states-vulnerabilities*` | Vulnerability listing, critical vulnerabilities, summaries |
+
+On 5.x see [Wazuh 5.x](#wazuh-5x) for the indices that replace these and the removed endpoints.
 
 With `ccs_prefix` set on a cluster in `clusters.json`, the pattern becomes
 `<prefix>:wazuh-alerts-*` for OpenSearch Cross-Cluster Search (`*` targets all remotes). The

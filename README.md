@@ -13,7 +13,7 @@ Lets an MCP client — Claude, Open WebUI backed by a local model, or any client
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![MCP 2026-07-28](https://img.shields.io/badge/MCP-2026--07--28-6E56CF)](https://modelcontextprotocol.io/specification/2026-07-28)
-[![Wazuh 4.8.0–4.14.7](https://img.shields.io/badge/Wazuh-4.8.0–4.14.7-005792?logo=wazuh&logoColor=white)](WAZUH_COMPATIBILITY.md)
+[![Wazuh 4.8.0–4.14.7, 5.0](https://img.shields.io/badge/Wazuh-4.8.0–4.14.7%20%7C%205.0-005792?logo=wazuh&logoColor=white)](WAZUH_COMPATIBILITY.md)
 [![GHCR image](https://img.shields.io/badge/ghcr.io-image-2496ED?logo=docker&logoColor=white)](https://github.com/gensecaihq/Wazuh-MCP-Server/pkgs/container/wazuh-mcp-server)
 
 [Quick Start](#quick-start) · [Clients](#connecting-clients) · [Tools](#tools) · [Security](#security-model) · [Configuration](#configuration) · [Docs](#documentation) · [Changelog](CHANGELOG.md) · [Upgrading](UPGRADING.md)
@@ -31,7 +31,7 @@ Lets an MCP client — Claude, Open WebUI backed by a local model, or any client
 - **Deployment:** Docker Compose or a published multi-arch image; optional Redis for multi-instance sessions; optional multi-cluster routing.
 - **Local models:** a vLLM + Open WebUI stack (`compose.local-llm.yml`) and toolset filtering for small models. The only tool that calls a service outside your Wazuh deployment is the optional `search_external_context` (You.com), which can be disabled on its own.
 
-Supported Wazuh versions: 4.8.0 through 4.14.7. Alert, vulnerability and alert-backed compliance tools need the Wazuh Indexer. See [WAZUH_COMPATIBILITY.md](WAZUH_COMPATIBILITY.md).
+Supported Wazuh versions: 4.8.0 through 4.14.7, and 5.0. Alert, vulnerability and alert-backed compliance tools need the Wazuh Indexer; on 5.0 inventory, SCA, FIM and rules tools need it too, and weekly statistics and the active-response write tools are not available. See [WAZUH_COMPATIBILITY.md](WAZUH_COMPATIBILITY.md).
 
 ---
 

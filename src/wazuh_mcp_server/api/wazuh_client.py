@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from wazuh_mcp_server.api import wazuh5
 from wazuh_mcp_server.api.wazuh_indexer import IndexerNotConfiguredError, WazuhIndexerClient
 from wazuh_mcp_server.config import TLS_FAILURE_HINT, WazuhConfig, env_bool, tls_verify
 from wazuh_mcp_server.resilience import CircuitBreaker, CircuitBreakerConfig, RetryConfig
@@ -246,6 +247,12 @@ class WazuhClient:
             )
         )
 
+        # Wazuh major version, read from GET / on first use (WAZUH_MAJOR_VERSION overrides).
+        # 5.x removed several Server API endpoints; _route_v5 maps the 4.x calls.
+        self._wazuh_major: Optional[int] = None
+        self._version_lock = asyncio.Lock()
+        self._node_name: Optional[str] = None
+
         # Initialize Wazuh Indexer client if configured (required for Wazuh 4.8.0+)
         self._indexer_client: Optional[WazuhIndexerClient] = None
         if config.wazuh_indexer_host:
@@ -258,6 +265,7 @@ class WazuhClient:
                 timeout=config.request_timeout_seconds,
                 use_ssl=getattr(config, "wazuh_indexer_ssl", True),
             )
+            self._indexer_client.version_provider = self.wazuh_major
             logger.info(f"WazuhIndexerClient configured for {config.wazuh_indexer_host}:{config.wazuh_indexer_port}")
         else:
             logger.warning(
@@ -669,6 +677,12 @@ class WazuhClient:
         only (no retry) because active response commands are not idempotent — retrying a
         PUT that already executed could double-isolate an agent or double-block an IP.
         """
+        # Wazuh 5.x: map endpoints that 5.0 removed or moved (see _route_v5)
+        if endpoint != "/" and await self.wazuh_major() >= 5:
+            endpoint, kwargs, routed = await self._route_v5(method, endpoint, kwargs)
+            if routed is not None:
+                return routed
+
         # Apply rate limiting
         async with self._rate_limiter:
             await self._rate_limit_check()
@@ -780,6 +794,171 @@ class WazuhClient:
             # Let timeout errors propagate for retry logic
             logger.error("Request timeout to Wazuh server")
             raise
+
+    # --- Wazuh 5.x --------------------------------------------------------------------------
+
+    async def wazuh_major(self) -> int:
+        """Major version of the Wazuh deployment (4 or 5), read once from GET /.
+
+        WAZUH_MAJOR_VERSION overrides the detection. When the Server API cannot be reached
+        the 4.x behavior is used and detection is retried on the next request.
+        """
+        if self._wazuh_major is not None:
+            return self._wazuh_major
+        async with self._version_lock:
+            if self._wazuh_major is None:
+                forced = os.getenv("WAZUH_MAJOR_VERSION", "").strip()
+                if forced:
+                    major = int(forced)
+                else:
+                    try:
+                        info = await self._request_with_resilience("GET", "/")
+                    except Exception as e:  # noqa: BLE001 - keep 4.x behavior, retry later
+                        logger.warning(f"Could not read the Wazuh version: {e}")
+                        return 4
+                    version = str((info.get("data") or {}).get("api_version") or "")
+                    match = re.match(r"v?(\d+)\.", version)
+                    major = int(match.group(1)) if match else 4
+                self._wazuh_major = major
+                if self._indexer_client is not None:
+                    self._indexer_client.wazuh_major = major
+                logger.info(f"Wazuh major version: {major}")
+        return self._wazuh_major
+
+    async def _node_id(self) -> str:
+        """Name of the cluster node this API runs on (5.x logs and stats are per node)."""
+        if not self._node_name:
+            info = await self._request_with_resilience("GET", "/cluster/local/info")
+            items = (info.get("data") or {}).get("affected_items") or []
+            node = items[0].get("node") if items else None
+            if not node:
+                raise ValueError("Could not determine the Wazuh cluster node name (GET /cluster/local/info)")
+            self._node_name = node
+        return self._node_name
+
+    @staticmethod
+    def _v5_unsupported(what: str, hint: str = "") -> ValueError:
+        err = ValueError(f"{what} is not available on Wazuh 5.x: the Server API no longer has it.{hint}")
+        err._service_alive = True
+        return err
+
+    def _v5_indexer(self, what: str) -> WazuhIndexerClient:
+        if not self._indexer_client:
+            raise IndexerNotConfiguredError(
+                f"Wazuh Indexer not configured. Wazuh 5.x keeps {what} in the indexer; "
+                "set WAZUH_INDEXER_HOST, WAZUH_INDEXER_USER and WAZUH_INDEXER_PASS."
+            )
+        return self._indexer_client
+
+    @staticmethod
+    def _q_value(params: Dict[str, Any], field: str) -> Optional[str]:
+        """Value of a simple ``field=value`` Wazuh API ``q`` filter, if present."""
+        for part in str(params.get("q") or "").split(";"):
+            key, sep, value = part.partition("=")
+            if sep and key.strip() == field:
+                return value.strip()
+        return None
+
+    async def _route_v5(self, method: str, endpoint: str, kwargs: Dict[str, Any]):
+        """Map a 4.x Server API call to Wazuh 5.x.
+
+        Returns (endpoint, kwargs, None) for a call that goes to the Server API (possibly
+        rewritten), or (endpoint, kwargs, result) when the data comes from the indexer.
+        Raises ValueError for calls 5.x has no equivalent for.
+        """
+        m = method.upper()
+        path = endpoint.split("?", 1)[0].rstrip("/") or "/"
+        params: Dict[str, Any] = dict(kwargs.get("params") or {})
+        limit = int(params.get("limit", 500) or 500)
+        offset = int(params.get("offset", 0) or 0)
+        parts = path.strip("/").split("/")
+
+        if m == "GET" and path == "/agents":
+            if "select" in params:
+                select = wazuh5.agent_select(params["select"])
+                if select:
+                    params["select"] = select
+                else:
+                    params.pop("select")
+                kwargs = {**kwargs, "params": params}
+            return endpoint, kwargs, None
+
+        if path == "/manager/logs" and m == "GET":
+            return f"/cluster/{await self._node_id()}/logs", kwargs, None
+        if path in ("/manager/stats", "/manager/stats/hourly") and m == "GET":
+            return (
+                f"/cluster/{await self._node_id()}/daemons/stats",
+                {k: v for k, v in kwargs.items() if k != "params"},
+                None,
+            )
+        if path == "/manager/stats/remoted" and m == "GET":
+            return (
+                f"/cluster/{await self._node_id()}/daemons/stats",
+                {**kwargs, "params": {"daemons_list": "wazuh-manager-remoted"}},
+                None,
+            )
+        if path == "/manager/stats/analysisd" and m == "GET":
+            return endpoint, kwargs, await self._v5_analysisd_stats()
+        if path == "/manager/stats/weekly":
+            raise self._v5_unsupported("Weekly statistics", " Use get_wazuh_statistics for the daemon statistics.")
+        if path == "/manager/restart" and m == "PUT":
+            return "/cluster/restart", {**kwargs, "params": {"nodes_list": await self._node_id()}}, None
+        if path == "/active-response":
+            raise self._v5_unsupported(
+                "Running an active response through the API",
+                " In 5.x active responses are Notifications channels triggered by Alerting monitors "
+                "on findings, configured in the dashboard.",
+            )
+        if path in ("/manager/configuration", "/decoders", "/lists") or (
+            parts[0] == "agents" and len(parts) >= 3 and parts[2] == "stats"
+        ):
+            raise self._v5_unsupported(f"GET {path}")
+
+        if m == "GET" and parts[0] == "syscollector" and len(parts) == 3 and parts[2] in ("processes", "ports"):
+            idx = self._v5_indexer("agent inventory")
+            if parts[2] == "processes":
+                pid = self._q_value(params, "pid")
+                return (
+                    endpoint,
+                    kwargs,
+                    await idx.get_processes(parts[1], limit, offset, int(pid) if pid and pid.isdigit() else None),
+                )
+            return endpoint, kwargs, await idx.get_ports(parts[1], limit, offset)
+        if m == "GET" and parts[0] == "syscheck" and len(parts) == 2:
+            idx = self._v5_indexer("the FIM file inventory")
+            return endpoint, kwargs, await idx.get_fim_files(parts[1], self._q_value(params, "file"), limit, offset)
+        if m == "GET" and parts[0] == "sca" and len(parts) == 2:
+            return endpoint, kwargs, await self._v5_indexer("SCA results").get_sca_policies(parts[1])
+        if m == "GET" and parts[0] == "sca" and len(parts) == 4 and parts[2] == "checks":
+            return (
+                endpoint,
+                kwargs,
+                await self._v5_indexer("SCA results").get_sca_checks(
+                    parts[1], parts[3], limit, offset, self._q_value(params, "result")
+                ),
+            )
+        if m == "GET" and path == "/rules":
+            return endpoint, kwargs, await self._v5_indexer("the rules (content)").get_rules(limit, offset)
+
+        return endpoint, kwargs, None
+
+    async def _v5_analysisd_stats(self) -> Dict[str, Any]:
+        """5.x stand-in for /manager/stats/analysisd: the engine's daemon stats and the number
+        of events indexed in the last 24 hours (as total_events_decoded)."""
+        node = await self._node_id()
+        stats = await self._request_with_resilience(
+            "GET", f"/cluster/{node}/daemons/stats", params={"daemons_list": "wazuh-manager-analysisd"}
+        )
+        items = (stats.get("data") or {}).get("affected_items") or [{}]
+        item = dict(items[0])
+        if self._indexer_client is not None:
+            try:
+                item["total_events_decoded"] = await self._indexer_client.count_events("now-24h")
+                item["events_window"] = "24h"
+                item["events_source"] = wazuh5.EVENTS_INDEX
+            except Exception as e:  # noqa: BLE001 - the daemon stats are still useful
+                logger.warning(f"Could not count 5.x events: {e}")
+        return wazuh5.wazuh_items([item])
 
     async def get_manager_info(self) -> Dict[str, Any]:
         """Get Wazuh manager information (cached for 5 minutes)."""
